@@ -1,0 +1,4 @@
+tensorflow>=2.20.0
+opencv-python>=4.8.0
+numpy
+mediapipe
