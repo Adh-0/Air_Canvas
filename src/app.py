@@ -20,8 +20,11 @@ from src.utils import (
 )
 from src.ui import (
     draw_help_menu_pil, draw_bottom_text_box, draw_help_button,
-    draw_status_pill, draw_prediction_pill
+    draw_status_pill, draw_prediction_pill, draw_save_overlay
 )
+
+# Consistent window name used everywhere
+WINDOW_NAME = "Air Canvas"
 
 
 def launch():
@@ -30,11 +33,23 @@ def launch():
 
     # load classifier once
     print("Loading character model...", end=" ", flush=True)
-    classifier = tf.keras.models.load_model("models/model_eng_alphabets.h5")
-    print("ready.")
+    try:
+        classifier = tf.keras.models.load_model("models/model_eng_alphabets.h5")
+        print("ready.")
+    except Exception as e:
+        print(f"FAILED\nERROR: Could not load model: {e}")
+        return
 
-    tracker = init_hand_tracker()
+    try:
+        tracker = init_hand_tracker()
+    except Exception as e:
+        print(f"ERROR: Could not initialize hand tracker: {e}")
+        return
     camera = cv2.VideoCapture(0)
+    if not camera.isOpened():
+        print("ERROR: Could not open camera. Please check your webcam connection.")
+        tracker.close()
+        return
     
     # Request higher resolution to accommodate future text boxes
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
@@ -56,13 +71,25 @@ def launch():
     pen_active = False
     last_stroke_ts = 0.0
     last_erase_ts = 0.0
+    thumbs_up_ts = 0.0   # Track when thumbs up was first detected
+    thumbs_up_hold = 1.2  # Seconds to hold thumbs up before saving
 
-    cv2.namedWindow("Canvas", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+
+    consecutive_read_failures = 0
+    MAX_READ_FAILURES = 10
 
     while True:
         ok, raw_frame = camera.read()
         if not ok:
-            break
+            consecutive_read_failures += 1
+            print(f"WARNING: Camera read failed ({consecutive_read_failures}/{MAX_READ_FAILURES})")
+            if consecutive_read_failures >= MAX_READ_FAILURES:
+                print("ERROR: Too many consecutive camera failures. Exiting.")
+                break
+            time.sleep(0.05)
+            continue
+        consecutive_read_failures = 0
 
         frame = cv2.flip(raw_frame, 1)
         fh, fw = frame.shape[:2]
@@ -166,30 +193,38 @@ def launch():
                 last_stroke_ts = time.time()
                 
             # ---------------------------------------------
-            # STATE 5: SAVE & EXIT (Thumbs Up)
+            # STATE 5: SAVE & EXIT (Thumbs Up) — hold for 1.2s
             # ---------------------------------------------
             elif gesture == 'THUMBS_UP':
-                exit_w, exit_h = get_text_size_pil("Saving...", font_size=28)
-                cx, cy = fw // 2, fh // 2
-                x1, y1 = cx - exit_w // 2 - 30, cy - exit_h // 2 - 20
-                x2, y2 = cx + exit_w // 2 + 30, cy + exit_h // 2 + 20
-                
-                overlay = frame.copy()
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), (30, 30, 30), -1)
-                cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
-                frame = draw_text_with_pil(frame, "Saving...", (cx - exit_w // 2, cy - exit_h // 2), 
-                                           font_size=28, color=(255, 255, 255))
-                                           
-                cv2.imshow("Live Feed", frame)
-                cv2.waitKey(1)
-                time.sleep(1.0)
-                break
+                now = time.time()
+                if thumbs_up_ts == 0.0:
+                    thumbs_up_ts = now  # start the hold timer
+
+                hold_elapsed = now - thumbs_up_ts
+                hold_progress = min(hold_elapsed / thumbs_up_hold, 1.0)
+
+                frame = draw_save_overlay(frame, hold_progress)
+
+                if hold_elapsed >= thumbs_up_hold:
+                    # Show final saving frame then break
+                    frame = draw_save_overlay(frame, 1.0, saving=True)
+                    cv2.imshow(WINDOW_NAME, frame)
+                    cv2.waitKey(1)
+                    time.sleep(0.6)
+                    break
+
+                if pen_active:
+                    state["segments"].append(deque(maxlen=512))
+                    state["seg_idx"] += 1
+                    state["jitter_buf"].clear()
+                pen_active = False
                 
             # ---------------------------------------------
             # STATE 6: PAUSED (Open Palm)
             # ---------------------------------------------
             elif gesture == 'PAUSE':
                 frame = draw_status_pill(frame, "Paused")
+                thumbs_up_ts = 0.0  # reset save timer
                 if pen_active:
                     state["segments"].append(deque(maxlen=512))
                     state["seg_idx"] += 1
@@ -200,6 +235,7 @@ def launch():
             # STATE 7: NONE (Closed Fist or Unknown)
             # ---------------------------------------------
             else:
+                thumbs_up_ts = 0.0  # reset save timer
                 if pen_active:
                     state["segments"].append(deque(maxlen=512))
                     state["seg_idx"] += 1
@@ -207,6 +243,7 @@ def launch():
                 pen_active = False
 
         else:
+            thumbs_up_ts = 0.0  # reset save timer when no hand detected
             if pen_active:
                 state["segments"].append(deque(maxlen=512))
                 state["seg_idx"] += 1
@@ -218,7 +255,12 @@ def launch():
                 and not pen_active
                 and not state["predicted"]
                 and time.time() - last_stroke_ts > RECOGNITION_DELAY):
-            char, conf = extract_and_classify(state["surface"], classifier)
+            try:
+                char, conf = extract_and_classify(state["surface"], classifier)
+            except Exception as e:
+                print(f"WARNING: Recognition error: {e}")
+                char, conf = None, 0.0
+
             if char:
                 # ---------------------------------------------
                 # THE AUTO-ACCEPT ENGINE (>80% confidence)
@@ -233,7 +275,7 @@ def launch():
                     
                     # Force render the updated text box
                     frame = draw_bottom_text_box(frame, "".join(output_chars))
-                    cv2.imshow("Live Feed", frame)
+                    cv2.imshow(WINDOW_NAME, frame)
                     cv2.waitKey(1)
                     time.sleep(0.5)
                     
@@ -256,7 +298,7 @@ def launch():
         # -- Render Final Accepted Word Box --
         frame = draw_bottom_text_box(frame, "".join(output_chars))
 
-        cv2.imshow("Live Feed", frame)
+        cv2.imshow(WINDOW_NAME, frame)
         cv2.imshow("Canvas", state["surface"])
 
         # -- keyboard input (Fallbacks only) --
@@ -265,17 +307,28 @@ def launch():
             break
 
     # -- teardown --
-    tracker.close()
-    camera.release()
+    try:
+        tracker.close()
+    except Exception as e:
+        print(f"WARNING: Error closing hand tracker: {e}")
+    try:
+        camera.release()
+    except Exception as e:
+        print(f"WARNING: Error releasing camera: {e}")
     cv2.destroyAllWindows()
 
     if output_chars:
         final = "".join(output_chars)
-        with open("output/recognized_text.txt", "w") as fout:
-            fout.write(final + "\n")
-        print(f"\n{'=' * 40}")
-        print(f"Final text: {final}")
-        print(f"Saved to: output/recognized_text.txt")
-        print(f"{'=' * 40}")
+        out_path = os.path.join("output", "recognized_text.txt")
+        try:
+            with open(out_path, "w", encoding="utf-8") as fout:
+                fout.write(final + "\n")
+            print(f"\n{'=' * 40}")
+            print(f"Final text : {final}")
+            print(f"Saved to   : {os.path.abspath(out_path)}")
+            print(f"{'=' * 40}")
+        except OSError as e:
+            print(f"ERROR: Could not save file: {e}")
+            print(f"Final text : {final}")
     else:
-        print("\nNo characters recognized.")
+        print("\nNo characters recognized. Nothing to save.")
